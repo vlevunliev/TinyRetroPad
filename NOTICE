@@ -1,0 +1,7 @@
+TinyRetroPad
+Copyright 2026 Victor Levunliev
+
+This product is a Free Pascal port and extension of trpad.asm
+("Dave's Tiny Editor" / Tiny App lineage) by Dave Plummer,
+licensed under the Apache License, Version 2.0.
+https://github.com/davepl

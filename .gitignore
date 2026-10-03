@@ -1,0 +1,15 @@
+# build output
+lib/
+backup/
+*.exe
+*.o
+*.ppu
+*.a
+*.compiled
+*.dbg
+
+# Lazarus session / generated project resources
+*.lps
+trpad.res
+*.bak
+*.zip

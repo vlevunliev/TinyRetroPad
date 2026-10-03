@@ -1,0 +1,2 @@
+// windres trpad_res.rc -O res -o trpad_res.res
+1 24 "trpad.manifest"
