@@ -28,6 +28,7 @@ program trpad;
   2.6: Ctrl+Enter изпълнява текущия ред като команда, изходът идва отдолу
   2.6.1: cmd /u - вградените команди на cmd вече не губят кирилица ("г." в dir)
   2.7: планер - ред "@ утре 09:00 ..." + Ctrl+Enter = задача в Task Scheduler
+  2.7.1: Ctrl+D вмъква ден от седмицата, дата и час
   --------------------------------------------------------- }
 {$mode objfpc}{$H+}
 {$APPTYPE GUI}
@@ -397,6 +398,7 @@ const
   IDM_EDIT_DELETE    = $E214;
   IDM_EDIT_SELALL    = $E215;
   IDM_EDIT_TIME      = $E216;
+  IDM_EDIT_DAYTIME   = $E2D5;
   IDM_EDIT_FIND      = $E217;
   IDM_EDIT_FINDNEXT  = $E218;
   IDM_EDIT_REPLACE   = $E219;
@@ -462,9 +464,9 @@ const
   RichDll   : PWideChar = 'Msftedit.dll';
   EditClass : PWideChar = 'RICHEDIT50W';
   AppName   = 'TinyRetroPad';
-  AboutText = 'TinyRetroPad 2.7 - tiny notepad-style editor'#13#10 +
+  AboutText = 'TinyRetroPad 2.7.1 - tiny notepad-style editor'#13#10 +
               'Pascal port of Dave Plummer''s trpad.asm, tuned.';
-  HelpUrl   = 'https://github.com/davepl';
+  HelpUrl   = 'https://github.com/vlevunliev/TinyRetroPad';
   RegKey    = 'Software\TinyRetroPad';
   FileFilter = 'Text Documents (*.txt)'#0'*.txt'#0'All Files (*.*)'#0'*.*'#0;
 
@@ -1817,6 +1819,21 @@ begin
   GetTimeFormatW(LOCALE_USER_DEFAULT, TIME_NOSECONDS, @st, nil, @tb[0], 64);
   GetDateFormatW(LOCALE_USER_DEFAULT, DATE_SHORTDATE, @st, nil, @db[0], 64);
   t := UnicodeString(PWideChar(@tb[0])) + ' ' + UnicodeString(PWideChar(@db[0]));   // като Notepad: час дата
+  EdMsg(EM_REPLACESEL, WPARAM(True), LPARAM(PWideChar(t)));
+end;
+
+{ ---- Edit > Day and Time (Ctrl+D): "понеделник, 05.10.2026 14:32" ----
+  името на деня идва от регионалните настройки на Windows }
+procedure InsertDayTime;
+var
+  st: TSystemTime;
+  db, tb: array[0..63] of WideChar;
+  t: UnicodeString;
+begin
+  GetLocalTime(@st);
+  GetDateFormatW(LOCALE_USER_DEFAULT, 0, @st, 'dddd, dd.MM.yyyy', @db[0], 64);
+  GetTimeFormatW(LOCALE_USER_DEFAULT, 0, @st, 'HH:mm', @tb[0], 64);
+  t := UnicodeString(PWideChar(@db[0])) + ' ' + UnicodeString(PWideChar(@tb[0]));
   EdMsg(EM_REPLACESEL, WPARAM(True), LPARAM(PWideChar(t)));
 end;
 
@@ -4780,6 +4797,7 @@ begin
   Sep(hPop);
   Item(hPop, IDM_EDIT_SELALL,   'Select &All'#9'Ctrl+A');
   Item(hPop, IDM_EDIT_TIME,     'Time/&Date'#9'F5');
+  Item(hPop, IDM_EDIT_DAYTIME,  'Da&y and Time'#9'Ctrl+D');
   Item(hPop, IDM_EDIT_CALC,     'Ca&lculate'#9'F9');
   Item(hPop, IDM_EDIT_FIXLAYOUT, 'Fi&x Keyboard Layout'#9'Ctrl+Shift+K');
 
@@ -4852,7 +4870,7 @@ begin
 end;
 
 const
-  AccelTable: array[0..23] of TAccelEntry = (
+  AccelTable: array[0..24] of TAccelEntry = (
     (fVirt: FVIRTKEY or FCONTROL;          key: Ord('N'); cmd: IDM_FILE_NEW),
     (fVirt: FVIRTKEY or FCONTROL;          key: Ord('O'); cmd: IDM_FILE_OPEN),
     (fVirt: FVIRTKEY or FCONTROL;          key: Ord('S'); cmd: IDM_SAVE),
@@ -4864,6 +4882,7 @@ const
     (fVirt: FVIRTKEY;                      key: VK_F3;    cmd: IDM_EDIT_FINDNEXT),
     (fVirt: FVIRTKEY or FSHIFT;            key: VK_F3;    cmd: IDM_EDIT_FINDPREV),
     (fVirt: FVIRTKEY;                      key: VK_F5;    cmd: IDM_EDIT_TIME),
+    (fVirt: FVIRTKEY or FCONTROL;          key: Ord('D'); cmd: IDM_EDIT_DAYTIME),
     (fVirt: FVIRTKEY or FCONTROL;          key: VK_OEM_PLUS_K;  cmd: IDM_VIEW_ZOOMIN),
     (fVirt: FVIRTKEY or FCONTROL;          key: VK_ADD;         cmd: IDM_VIEW_ZOOMIN),
     (fVirt: FVIRTKEY or FCONTROL;          key: VK_OEM_MINUS_K; cmd: IDM_VIEW_ZOOMOUT),
@@ -5073,6 +5092,11 @@ begin
             begin
               SetFocus(hEdit);
               EdMsg(EM_SETSEL, 0, -1);
+            end;
+          IDM_EDIT_DAYTIME:
+            begin
+              SetFocus(hEdit);
+              InsertDayTime;
             end;
           IDM_EDIT_TIME:
             begin

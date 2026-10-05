@@ -4,6 +4,8 @@
 
 It began as a Pascal port of Dave Plummer's tiny assembly editor `trpad.asm`. Then it grew. Now it reads text aloud, runs the line under the cursor as a shell command, schedules reminders in Windows Task Scheduler, and still fits in a single source file.
 
+**[⬇ Download trpad.exe (Releases)](https://github.com/vlevunliev/TinyRetroPad/releases/latest)** · Windows 10/11 x64, no installer, just run it.
+
 ![Run the current line as a command](docs/screenshots/run-line-dir.png)
 
 > *Българска версия – [по-долу](#на-български).*
@@ -76,6 +78,7 @@ The same in Bulgarian: `днес`, `утре`, `вдругиден`, `пн..нд
 | **Ctrl+F**, **Ctrl+H**, **Ctrl+G** | Find, Replace, Go To line |
 | **Ctrl+Plus** / **Ctrl+Minus** / **Ctrl+0**, Ctrl+wheel | Zoom |
 | **F5** | Insert time and date |
+| **Ctrl+D** | Insert day, date and time: `Monday, 05.10.2026 14:32` (weekday in your Windows language) |
 | Ctrl+N / O / S / Shift+S / P | New, Open, Save, Save As, Print |
 
 ## More screenshots

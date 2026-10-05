@@ -1,5 +1,8 @@
 # Changelog
 
+## 2.7.1
+- **Ctrl+D** inserts the weekday, date and time (`понеделник, 05.10.2026 14:32`). The weekday name follows the Windows regional settings.
+
 ## 2.7
 - **Planner:** `@ <when> <time> <text or command>` + Ctrl+Enter registers a task in Windows Task Scheduler (folder `\TinyRetroPad\`). Bulgarian and English syntax: today/tomorrow, dates, weekdays, every day, every mon,wed, in N min/h.
 - Text becomes a reminder (`trpad.exe /remind`): a topmost box, read aloud. Programs and scripts are run.
