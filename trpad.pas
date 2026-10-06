@@ -324,6 +324,7 @@ const
 
   TIMER_STATS    = 1;
   TIMER_AUTOSAVE = 2;
+  TIMER_SUMS     = 3;
   AUTOSAVE_MS    = {$IFDEF TESTFAST}1500{$ELSE}30000{$ENDIF};
   MRU_MAX        = 8;
   WM_APP_CHECKFILE = WM_APP + 2;
@@ -433,6 +434,12 @@ const
   IDM_TOOLS_TASKS    = $E2D2;
   IDM_TOOLS_DELTASK  = $E2D3;
   IDM_TOOLS_SCHEDHELP = $E2D4;
+  IDM_EDIT_CHECK     = $E2D6;
+  IDM_TOOLS_FILTER   = $E2D7;
+  IDM_TOOLS_SUMS     = $E2D8;
+  IDM_HIST_FIRST     = $E300;      // + индекс (до 30 версии в менюто)
+  IDM_HIST_LAST      = $E31D;
+  IDM_HIST_FOLDER    = $E330;
   IDM_SPEAK_REMIND   = $E2C9;
   IDM_FMT_WRAP       = $E220;
   IDM_FMT_FONT       = $E221;
@@ -464,7 +471,7 @@ const
   RichDll   : PWideChar = 'Msftedit.dll';
   EditClass : PWideChar = 'RICHEDIT50W';
   AppName   = 'TinyRetroPad';
-  AboutText = 'TinyRetroPad 2.7.1 - tiny notepad-style editor'#13#10 +
+  AboutText = 'TinyRetroPad 2.8 - tiny notepad-style editor'#13#10 +
               'Pascal port of Dave Plummer''s trpad.asm, tuned.';
   HelpUrl   = 'https://github.com/vlevunliev/TinyRetroPad';
   RegKey    = 'Software\TinyRetroPad';
@@ -696,7 +703,17 @@ var
   gRunBufLen, gRunBufCap: DWORD;
   gRunNotified: Boolean = False;
   gRunPendCR: Boolean = False;        // CR в края на парче - LF може да дойде в следващото
-  gRunTempFile: UnicodeString = '';   // XML на задачата - трие се след schtasks
+  gRunTempFile: UnicodeString = '';   // XML на задачата / скрипт - трие се накрая
+  gRunInput: TBytes;                  // stdin за филтъра
+  gRunInWrite: THandle = 0;
+  gRunWriterH: THandle = 0;
+  gRunFilter: Boolean = False;        // изходът замества текста, вместо да се вмъква
+  gFilterOut: UnicodeString = '';
+  gFilterA, gFilterB: LongInt;
+  gFilterEndsBreak: Boolean = False;
+  fLiveSums: Boolean = True;          // "общо =" се смята само
+  gSumBusy : Boolean = False;         // нашите собствени промени не пускат таймера
+  gUndoTick: DWORD = 0;               // Ctrl+Z/Y току-що -> не пресмятаме наново
   fRemindSpeak: Boolean = True;       // напомнянията се четат на глас
   RichFont : TCharFormatW;            // текущ шрифт (face, size, bold/italic)
 
@@ -1019,6 +1036,7 @@ begin
   CheckItem(IDM_VIEW_STATUS, fStatus);
   CheckItem(IDM_FMT_SPELL, fSpell);
   CheckItem(IDM_FMT_AUTOINDENT, fAutoIndent);
+  CheckItem(IDM_TOOLS_SUMS, fLiveSums);
   SyncVoiceMenu;
 {$IFDEF FEAT_LINENUMBERS}
   CheckItem(IDM_VIEW_LINENUM, fLineNum);
@@ -1669,6 +1687,315 @@ begin
   Result := True;
 end;
 
+{ ======================= машина на времето ======================= }
+
+{ При всеки Save копие на записаното отива в
+    %LOCALAPPDATA%\TinyRetroPad\history\<име>-<hash>\2026-10-05_17-56-03.txt
+  Първият запис пази и стария вариант от диска. Еднакви поредни версии не
+  се дублират; пазят се последните HIST_MAX. File -> History връща версия
+  с едно щракване (като едно Undo действие). }
+
+const
+  HIST_MAX     = 100;
+  HIST_MENU    = 30;
+  HIST_MAXSIZE = 32 * 1024 * 1024;
+  HexDigits    = '0123456789abcdef';
+
+type
+  THistArr = array of UnicodeString;
+
+var
+  gHistMenu : HMENU = 0;
+  gHistItems: THistArr;               // имена на файлове, най-новите първи
+  gHistDirShown: UnicodeString = '';
+
+{$PUSH}{$Q-}{$R-}
+function HistHash(const s: UnicodeString): DWORD;
+var
+  i: Integer;
+begin
+  Result := 2166136261;
+  for i := 1 to Length(s) do
+    Result := (Result xor Ord(s[i])) * 16777619;
+end;
+{$POP}
+
+function HexDW(x: DWORD): UnicodeString;
+var
+  i: Integer;
+begin
+  SetLength(Result, 8);
+  for i := 8 downto 1 do
+  begin
+    Result[i] := WideChar(HexDigits[(x and 15) + 1]);
+    x := x shr 4;
+  end;
+end;
+
+function ZPad(n, w: Integer): UnicodeString;
+begin
+  Result := IStr(n);
+  while Length(Result) < w do Result := '0' + Result;
+end;
+
+function FileExt(const fn: UnicodeString): UnicodeString;
+var
+  i: Integer;
+begin
+  Result := '';
+  i := Length(fn);
+  while (i > 0) and (fn[i] <> '.') and (fn[i] <> '\') and (fn[i] <> '/') do Dec(i);
+  if (i > 0) and (fn[i] = '.') then Result := Copy(fn, i, MaxInt);
+  if (Result = '') or (Length(Result) > 10) then Result := '.txt';
+end;
+
+function HistDir(const fn: UnicodeString): UnicodeString;
+var
+  low, base: UnicodeString;
+  i: Integer;
+begin
+  low := FullPath(fn);
+  UniqueString(low);
+  if low <> '' then CharLowerBuffW(PWideChar(low), Length(low));
+  base := BaseName(fn);
+  UniqueString(base);
+  for i := 1 to Length(base) do
+    if (base[i] < ' ') or (Pos(base[i], UnicodeString('<>:"/\|?*')) > 0) then base[i] := '_';
+  if Length(base) > 40 then SetLength(base, 40);
+  Result := RecoveryDir + '\history\' + base + '-' + HexDW(HistHash(low));
+end;
+
+function StampName(const st: TSystemTime; const ext: UnicodeString): UnicodeString;
+begin
+  Result := ZPad(st.wYear, 4) + '-' + ZPad(st.wMonth, 2) + '-' + ZPad(st.wDay, 2) + '_' +
+            ZPad(st.wHour, 2) + '-' + ZPad(st.wMinute, 2) + '-' + ZPad(st.wSecond, 2) + ext;
+end;
+
+// "2026-10-05_17-56-03.txt" -> "05.10.2026  17:56:03"
+function StampLabel(const name: UnicodeString): UnicodeString;
+begin
+  if Length(name) < 19 then Exit(name);
+  Result := Copy(name, 9, 2) + '.' + Copy(name, 6, 2) + '.' + Copy(name, 1, 4) + '   ' +
+            Copy(name, 12, 2) + ':' + Copy(name, 15, 2) + ':' + Copy(name, 18, 2);
+end;
+
+function ReadAllBytes(const fn: UnicodeString; out data: TBytes; maxSize: DWORD): Boolean;
+var
+  h: THandle;
+  size, hi, got: DWORD;
+begin
+  Result := False;
+  SetLength(data, 0);
+  h := CreateFileW(PWideChar(fn), GENERIC_READ, FILE_SHARE_READ or FILE_SHARE_WRITE,
+                   nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+  if h = INVALID_HANDLE_VALUE then Exit;
+  hi := 0;
+  size := GetFileSize(h, @hi);
+  if (size <> $FFFFFFFF) and (hi = 0) and (size <= maxSize) then
+  begin
+    SetLength(data, size);
+    got := 0;
+    if (size = 0) or (ReadFile(h, data[0], size, got, nil) and (got = size)) then
+      Result := True;
+  end;
+  CloseHandle(h);
+end;
+
+function WriteAllBytes(const fn: UnicodeString; const data: TBytes): Boolean;
+var
+  h: THandle;
+  w: DWORD;
+begin
+  Result := False;
+  h := CreateFileW(PWideChar(fn), GENERIC_WRITE, 0, nil, CREATE_ALWAYS,
+                   FILE_ATTRIBUTE_NORMAL, 0);
+  if h = INVALID_HANDLE_VALUE then Exit;
+  w := 0;
+  if Length(data) > 0 then WriteFile(h, data[0], Length(data), w, nil);
+  CloseHandle(h);
+  Result := w = DWORD(Length(data));
+end;
+
+function SameBytes(const a, b: TBytes): Boolean;
+var
+  i: Integer;
+begin
+  Result := Length(a) = Length(b);
+  if Result then
+    for i := 0 to High(a) do
+      if a[i] <> b[i] then Exit(False);
+end;
+
+// версиите в папката, най-новите първи
+function HistList(const dir: UnicodeString): THistArr;
+var
+  fd: TWin32FindDataW;
+  h: THandle;
+  n, i, j: Integer;
+  nm, t: UnicodeString;
+begin
+  SetLength(Result, 0);
+  n := 0;
+  h := FindFirstFileW(PWideChar(dir + '\*'), fd);
+  if h = INVALID_HANDLE_VALUE then Exit;
+  repeat
+    nm := PWideChar(@fd.cFileName[0]);
+    if ((fd.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY) = 0) and
+       (Length(nm) >= 19) and (nm[1] >= '0') and (nm[1] <= '9') then
+    begin
+      if n >= Length(Result) then SetLength(Result, n * 2 + 16);
+      Result[n] := nm;
+      Inc(n);
+    end;
+  until not FindNextFileW(h, fd);
+  Windows.FindClose(h);
+  SetLength(Result, n);
+  for i := 1 to n - 1 do                // insertion sort, низходящо
+  begin
+    t := Result[i];
+    j := i - 1;
+    while (j >= 0) and (Result[j] < t) do
+    begin
+      Result[j + 1] := Result[j];
+      Dec(j);
+    end;
+    Result[j + 1] := t;
+  end;
+end;
+
+procedure HistEnsureDir(const dir, fn: UnicodeString);
+var
+  info: TBytes;
+  lossy: Boolean;
+begin
+  CreateDirectoryW(PWideChar(RecoveryDir), nil);
+  CreateDirectoryW(PWideChar(RecoveryDir + '\history'), nil);
+  if CreateDirectoryW(PWideChar(dir), nil) then
+  begin                               // за човека, който разглежда папката
+    info := EncodeText(FullPath(fn) + #13#10, encUTF8BOM, lossy);
+    WriteAllBytes(dir + '\_file.txt', info);
+  end;
+end;
+
+procedure HistStore(const fn: UnicodeString; const data: TBytes; const st: TSystemTime);
+var
+  dir: UnicodeString;
+  L: THistArr;
+  prev: TBytes;
+  i: Integer;
+begin
+  if (fn = '') or (Length(data) > HIST_MAXSIZE) then Exit;
+  dir := HistDir(fn);
+  HistEnsureDir(dir, fn);
+  L := HistList(dir);
+  if (Length(L) > 0) and ReadAllBytes(dir + '\' + L[0], prev, HIST_MAXSIZE) and
+     SameBytes(prev, data) then Exit;          // нищо ново
+  WriteAllBytes(dir + '\' + StampName(st, FileExt(fn)), data);
+  L := HistList(dir);
+  for i := HIST_MAX to High(L) do
+    DeleteFileW(PWideChar(dir + '\' + L[i]));
+end;
+
+// преди първия запис: старото съдържание на диска става версия
+procedure HistoryBeforeSave(const fn: UnicodeString);
+var
+  data: TBytes;
+  ad: TFileAttrData;
+  lft: TFileTime;
+  st: TSystemTime;
+begin
+  if not FileExists(fn) then Exit;
+  if Length(HistList(HistDir(fn))) > 0 then Exit;
+  if not ReadStamp(fn, ad) then Exit;
+  if not ReadAllBytes(fn, data, HIST_MAXSIZE) then Exit;
+  FileTimeToLocalFileTime(ad.ftLastWriteTime, lft);
+  FileTimeToSystemTime(@lft, @st);
+  HistStore(fn, data, st);
+end;
+
+procedure HistoryAfterSave(const fn: UnicodeString; const data: TBytes);
+var
+  st: TSystemTime;
+begin
+  GetLocalTime(@st);
+  HistStore(fn, data, st);
+end;
+
+procedure HistBuildMenu;
+var
+  i, n: Integer;
+  dir: UnicodeString;
+  ad: TFileAttrData;
+  sz: Int64;
+  szs: UnicodeString;
+begin
+  while GetMenuItemCount(gHistMenu) > 0 do DeleteMenu(gHistMenu, 0, MF_BYPOSITION);
+  SetLength(gHistItems, 0);
+  if gFile = '' then
+  begin
+    AppendMenuW(gHistMenu, MF_STRING or MF_GRAYED, 0, '(save the file first)');
+    Exit;
+  end;
+  dir := HistDir(gFile);
+  gHistDirShown := dir;
+  gHistItems := HistList(dir);
+  n := Length(gHistItems);
+  if n > HIST_MENU then n := HIST_MENU;
+  if n = 0 then
+    AppendMenuW(gHistMenu, MF_STRING or MF_GRAYED, 0, '(no versions yet - they appear when you save)')
+  else
+    for i := 0 to n - 1 do
+    begin
+      szs := '';
+      if ReadStamp(dir + '\' + gHistItems[i], ad) then
+      begin
+        sz := Int64(ad.nFileSizeHigh) shl 32 or ad.nFileSizeLow;
+        if sz < 10240 then szs := IStr(sz) + ' bytes'
+        else szs := IStr((sz + 512) div 1024) + ' KB';
+      end;
+      Item(gHistMenu, IDM_HIST_FIRST + i, StampLabel(gHistItems[i]) + #9 + szs);
+    end;
+  AppendMenuW(gHistMenu, MF_SEPARATOR, 0, nil);
+  Item(gHistMenu, IDM_HIST_FOLDER, 'Open History &Folder');
+end;
+
+procedure HistRestore(idx: Integer);
+var
+  data: TBytes;
+  text: UnicodeString;
+  enc: TEncoding;
+  eol: TEol;
+  cr: TCharRange;
+begin
+  if (gFile <> '') and (gHistDirShown <> HistDir(gFile)) then HistBuildMenu;
+  if (idx < 0) or (idx > High(gHistItems)) or (gHistDirShown = '') then Exit;
+  if not ReadAllBytes(gHistDirShown + '\' + gHistItems[idx], data, HIST_MAXSIZE) then
+  begin
+    MsgBox('Cannot read this version.', MB_OK or MB_ICONWARNING);
+    Exit;
+  end;
+  if Length(data) > 0 then DecodeBytes(@data[0], Length(data), text, enc)
+  else text := '';
+  text := ConvertEol(text, eolCR, nil, eol);
+  ReplaceRange(0, TextLenInternal, text, False);   // едно Undo действие
+  cr.cpMin := 0; cr.cpMax := 0;
+  EdMsg(EM_EXSETSEL, 0, LPARAM(@cr));
+  EdMsg(EM_SCROLLCARET, 0, 0);
+  gStatusNote := 'Restored the version from ' + StampLabel(gHistItems[idx]) +
+                 '  -  Ctrl+Z brings back what you had';
+  ScheduleStats;
+end;
+
+procedure HistOpenFolder;
+var
+  dir: UnicodeString;
+begin
+  if gFile = '' then Exit;
+  dir := HistDir(gFile);
+  if GetFileAttributesW(PWideChar(dir)) = $FFFFFFFF then dir := RecoveryDir + '\history';
+  ShellExecuteW(0, 'open', PWideChar(dir), nil, nil, SW_SHOWNORMAL);
+end;
+
 function SaveTo(const fn: UnicodeString): Boolean;
 var
   hFile: THandle;
@@ -1694,6 +2021,7 @@ begin
       IDCANCEL: Exit;
     end;
 
+  HistoryBeforeSave(fn);              // първи запис: старото от диска става версия
   hFile := CreateFileW(PWideChar(fn), GENERIC_WRITE, 0, nil,
                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
   if hFile = INVALID_HANDLE_VALUE then
@@ -1711,6 +2039,7 @@ begin
     Exit;
   end;
   gFile := FullPath(fn);
+  HistoryAfterSave(gFile, data);
   fDirty := False;
   MruAdd(gFile);
   TakeStamp;                          // собственият запис не е "външна промяна"
@@ -3525,15 +3854,499 @@ begin
   ReplaceRange(ins, ins, ins_t, False);
 end;
 
+{ ======================= живи сметки ======================= }
+
+{ Ред "общо =" (сума =, средно =, макс =, мин =, брой =, total =, avg =...)
+  сам смята числата от редовете над себе си - до празен ред или до
+  предишна група сметки. От всеки ред се взима последното число
+  ("хляб 2,50", "мляко 3,20 лв", "2*1,25 = 2,5" -> 2,5). Часове (10:30)
+  и дати (05.10.2026) не са числа. Редове, завършващи с ":", са заглавия. }
+
+const
+  SUM_SUM = 0; SUM_AVG = 1; SUM_MAX = 2; SUM_MIN = 3; SUM_CNT = 4;
+  SUMS_MAXTEXT = 4 * 1024 * 1024;
+
+type
+  TSumAcc = record
+    cnt, maxDec: Integer;
+    sum, mx, mn: Double;
+    anyComma, anyPoint, grouped: Boolean;
+  end;
+
+function SumKind(const label_: UnicodeString): Integer;
+var
+  l: UnicodeString;
+begin
+  l := LowerStr(TrimW(label_));
+  while (l <> '') and (l[Length(l)] = ':') do SetLength(l, Length(l) - 1);
+  l := TrimW(l);
+  if (l = #$043E#$0431#$0449#$043E) or (l = #$0441#$0443#$043C#$0430) or      // общо, сума
+     (l = #$0432#$0441#$0438#$0447#$043A#$043E) or (l = 'total') or (l = 'sum') then Exit(SUM_SUM);  // всичко
+  if (l = #$0441#$0440#$0435#$0434#$043D#$043E) or (l = 'avg') or (l = 'average') then Exit(SUM_AVG); // средно
+  if (l = #$043C#$0430#$043A#$0441) or (l = #$043C#$0430#$043A#$0441#$0438#$043C#$0443#$043C) or  // макс, максимум
+     (l = 'max') then Exit(SUM_MAX);
+  if (l = #$043C#$0438#$043D) or (l = #$043C#$0438#$043D#$0438#$043C#$0443#$043C) or            // мин, минимум
+     (l = 'min') then Exit(SUM_MIN);
+  if (l = #$0431#$0440#$043E#$0439) or (l = 'count') then Exit(SUM_CNT);  // брой
+  Result := -1;
+end;
+
+function IsDigitW(c: WideChar): Boolean; inline;
+begin
+  Result := (c >= '0') and (c <= '9');
+end;
+
+// "1 250,50" / "3.20" / "-7" -> число; dec = знаци след десетичния разделител
+function ParseNumStr(s: UnicodeString; out v: Double; out dec: Integer;
+  out comma, point: Boolean): Boolean;
+var
+  i, code, sep: Integer;
+  t: ShortString;
+begin
+  Result := False;
+  dec := 0; comma := False; point := False;
+  t := '';
+  sep := 0;
+  for i := 1 to Length(s) do
+    case s[i] of
+      '0'..'9': begin t := t + AnsiChar(Ord(s[i])); if sep > 0 then Inc(dec); end;
+      '-': if i = 1 then t := '-' else Exit;
+      ',', '.':
+        begin
+          Inc(sep);
+          if sep > 1 then Exit;
+          if s[i] = ',' then comma := True else point := True;
+          t := t + '.';
+        end;
+      ' ', #$00A0: ;                  // групи хиляди
+    else
+      Exit;
+    end;
+  if (t = '') or (t = '-') or (t[Length(t)] = '.') then Exit;
+  Val(t, v, code);
+  Result := code = 0;
+end;
+
+// последното число в реда
+function LastNumber(const s: UnicodeString; out v: Double; out nd: Integer;
+  out comma, point, grouped: Boolean): Boolean;
+var
+  i, j, k, a, b: Integer;
+  run: UnicodeString;
+  bad: Boolean;
+begin
+  Result := False;
+  grouped := False;
+  i := Length(s);
+  while i >= 1 do
+  begin
+    if not IsDigitW(s[i]) then begin Dec(i); Continue; end;
+    j := i;
+    while (j >= 1) and (IsDigitW(s[j]) or (s[j] = '.') or (s[j] = ',') or (s[j] = ':')) do Dec(j);
+    a := j + 1; b := i;               // s[a..b]
+    i := j;                           // следващият опит е вляво от тази група
+    bad := False;
+    for k := a to b do if s[k] = ':' then bad := True;      // час
+    while (a <= b) and not IsDigitW(s[a]) do Inc(a);        // ".5" -> "5"
+    if bad or (a > b) then Continue;
+    run := Copy(s, a, b - a + 1);
+    // хиляди с интервал: "1 250,50" - групата пред нас е 1..3 цифри,
+    // а нашата цяла част е точно 3 цифри
+    k := 0;
+    while (k < Length(run)) and IsDigitW(run[k + 1]) do Inc(k);
+    while (k = 3) and (a >= 3) and ((s[a - 1] = ' ') or (s[a - 1] = #$00A0)) and IsDigitW(s[a - 2]) do
+    begin
+      j := a - 2;
+      while (j >= 1) and IsDigitW(s[j]) do Dec(j);
+      k := a - 2 - j;                 // дължината на групата отпред
+      if (k > 3) or ((j >= 1) and ((s[j] = '.') or (s[j] = ',') or (s[j] = ':'))) then Break;
+      run := Copy(s, j + 1, k) + run;
+      a := j + 1;
+      grouped := True;
+    end;
+    if (a >= 2) and (s[a - 1] = '-') and ((a = 2) or not IsCharAlphaNumericW(s[a - 2])) then
+      run := '-' + run;
+    if ParseNumStr(run, v, nd, comma, point) then Exit(True);
+  end;
+end;
+
+// "общо = 5,70" -> kind; eq = позицията на "=" (1-базирана)
+function ParseSumLine(const s: UnicodeString; out kind, eq: Integer): Boolean;
+var
+  rest: UnicodeString;
+  v: Double;
+  d: Integer;
+  c, p: Boolean;
+begin
+  Result := False;
+  eq := Pos('=', s);
+  if eq < 2 then Exit;
+  kind := SumKind(Copy(s, 1, eq - 1));
+  if kind < 0 then Exit;
+  rest := TrimW(Copy(s, eq + 1, MaxInt));
+  Result := (rest = '') or ParseNumStr(rest, v, d, c, p);
+end;
+
+function DefaultDecimalComma: Boolean;
+var
+  buf: array[0..7] of WideChar;
+begin
+  FillChar(buf, SizeOf(buf), 0);
+  GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_SDECIMAL, @buf[0], 8);
+  Result := buf[0] <> '.';
+end;
+
+function GroupThousands(const s: UnicodeString): UnicodeString;
+var
+  i, e, st, n: Integer;
+begin
+  st := 1;
+  if (s <> '') and (s[1] = '-') then st := 2;
+  e := st;
+  while (e <= Length(s)) and IsDigitW(s[e]) do Inc(e);
+  Result := Copy(s, e, MaxInt);
+  n := 0;
+  for i := e - 1 downto st do
+  begin
+    if (n > 0) and (n mod 3 = 0) then Result := ' ' + Result;
+    Result := s[i] + Result;
+    Inc(n);
+  end;
+  if st = 2 then Result := '-' + Result;
+end;
+
+function FmtFixed(x: Double; dec: Integer; comma, grouped: Boolean): UnicodeString;
+var
+  t: ShortString;
+  i: Integer;
+begin
+  if dec > 6 then dec := 6;
+  if dec <= 0 then Str(x:0:0, t) else Str(x:0:dec, t);
+  Result := UnicodeString(t);
+  if Result = '-0' then Result := '0';
+  if (Length(Result) > 1) and (Result[1] = '-') and (Pos('.', Result) > 0) then
+  begin                               // "-0.00" -> "0.00"
+    i := 2;
+    while (i <= Length(Result)) and ((Result[i] = '0') or (Result[i] = '.')) do Inc(i);
+    if i > Length(Result) then Delete(Result, 1, 1);
+  end;
+  if grouped then Result := GroupThousands(Result);
+  if comma then
+    for i := 1 to Length(Result) do
+      if Result[i] = '.' then Result[i] := ',';
+end;
+
+function SumValue(const A: TSumAcc; kind: Integer; out txt: UnicodeString): Boolean;
+var
+  comma: Boolean;
+  x: Double;
+  d: Integer;
+begin
+  Result := A.cnt > 0;
+  if not Result then Exit;
+  comma := A.anyComma or ((not A.anyPoint) and DefaultDecimalComma);
+  d := A.maxDec;
+  case kind of
+    SUM_AVG:
+      begin
+        x := A.sum / A.cnt;
+        if d < 2 then d := 2;
+        txt := FmtFixed(x, d, comma, A.grouped);
+        // "1,50" при цели числа на входа е излишно -> "1,5"; "2,00" -> "2"
+        if A.maxDec = 0 then
+        begin
+          while (Pos(',', txt) + Pos('.', txt) > 0) and (txt[Length(txt)] = '0') do
+            SetLength(txt, Length(txt) - 1);
+          if (txt <> '') and ((txt[Length(txt)] = ',') or (txt[Length(txt)] = '.')) then
+            SetLength(txt, Length(txt) - 1);
+        end;
+        Exit;
+      end;
+    SUM_MAX: x := A.mx;
+    SUM_MIN: x := A.mn;
+    SUM_CNT: begin txt := IStr(A.cnt); Exit; end;
+  else
+    x := A.sum;
+  end;
+  txt := FmtFixed(x, d, comma, A.grouped);
+end;
+
+procedure UpdateLiveSums;
+type
+  TEdit_ = record a, b: LongInt; t: UnicodeString; end;
+var
+  text, line, val: UnicodeString;
+  ed: array of TEdit_;
+  ne, i, st, kind, eq, dec: Integer;
+  A: TSumAcc;
+  lastWasSum: Boolean;
+  v: Double;
+  c, p, g: Boolean;
+  cr: TCharRange;
+  total: LongInt;
+
+  procedure Reset;
+  begin
+    FillChar(A, SizeOf(A), 0);
+    lastWasSum := False;
+  end;
+
+  // позиция преди редакциите -> позиция след тях; курсор след "=" -> в края на реда
+  function MapPos(x: LongInt): LongInt;
+  var
+    k: Integer;
+    sh: LongInt;
+  begin
+    sh := 0;
+    for k := 0 to ne - 1 do
+      if x >= ed[k].b then Inc(sh, Length(ed[k].t) - (ed[k].b - ed[k].a))
+      else if x >= ed[k].a then Exit(ed[k].a + sh + Length(ed[k].t))
+      else Break;
+    Result := x + sh;
+  end;
+
+begin
+  if (not fLiveSums) or gRunning or gSpeaking or fLoading then Exit;
+  total := TextLenInternal;
+  if (total = 0) or (total > SUMS_MAXTEXT) then Exit;
+  text := GetRange(0, total);
+  if Pos('=', text) = 0 then Exit;
+  SetLength(ed, 0); ne := 0;
+  Reset;
+  st := 1;
+  for i := 1 to Length(text) + 1 do
+  begin
+    if (i <= Length(text)) and not IsBreak(text[i]) then Continue;
+    line := Copy(text, st, i - st);
+    if TrimW(line) = '' then Reset
+    else if ParseSumLine(line, kind, eq) then
+    begin
+      if SumValue(A, kind, val) then
+      begin
+        val := ' ' + val;
+        if Copy(line, eq + 1, MaxInt) <> val then
+        begin
+          if ne >= Length(ed) then SetLength(ed, ne * 2 + 4);
+          ed[ne].a := st - 1 + eq;    // 0-базирано: точно след "="
+          ed[ne].b := st - 1 + Length(line);
+          ed[ne].t := val;
+          Inc(ne);
+        end;
+      end;
+      lastWasSum := True;
+    end
+    else if TrimW(line)[Length(TrimW(line))] = ':' then
+      // заглавие
+    else if LastNumber(line, v, dec, c, p, g) then
+    begin
+      if lastWasSum then Reset;       // нова група след предишните сметки
+      if A.cnt = 0 then begin A.mx := v; A.mn := v; end;
+      Inc(A.cnt);
+      A.sum := A.sum + v;
+      if v > A.mx then A.mx := v;
+      if v < A.mn then A.mn := v;
+      if dec > A.maxDec then A.maxDec := dec;
+      A.anyComma := A.anyComma or c;
+      A.anyPoint := A.anyPoint or p;
+      A.grouped := A.grouped or g;
+    end;
+    st := i + 1;
+  end;
+  if ne = 0 then Exit;
+
+  EdMsg(EM_EXGETSEL, 0, LPARAM(@cr));
+  cr.cpMin := MapPos(cr.cpMin);
+  cr.cpMax := MapPos(cr.cpMax);
+  // всички промени като ЕДНА замяна -> едно Ctrl+Z ги връща всичките
+  line := '';
+  for i := 0 to ne - 1 do
+  begin
+    if i > 0 then line := line + Copy(text, ed[i - 1].b + 1, ed[i].a - ed[i - 1].b);
+    line := line + ed[i].t;
+  end;
+  gSumBusy := True;
+  try
+    ReplaceRange(ed[0].a, ed[ne - 1].b, line, False);
+    EdMsg(EM_EXSETSEL, 0, LPARAM(@cr));
+  finally
+    gSumBusy := False;
+  end;
+end;
+
+{ ======================= отметки [ ] / [x] ======================= }
+
+const
+  CheckMark = #$2713;
+
+// "  - [x] текст ✓ 05.10 17:56": отстъп+булет, състояние, текст
+// st: 0 няма кутийка, 1 [ ], 2 [x]
+function ParseCheck(const s: UnicodeString; out pre: UnicodeString; out st: Integer;
+  out body: UnicodeString): Boolean;
+var
+  i: Integer;
+  c: WideChar;
+begin
+  i := 1;
+  while (i <= Length(s)) and ((s[i] = ' ') or (s[i] = #9)) do Inc(i);
+  if (i < Length(s)) and ((s[i] = '-') or (s[i] = '*') or (s[i] = #$2022)) and (s[i + 1] = ' ') then
+    Inc(i, 2);
+  pre := Copy(s, 1, i - 1);
+  st := 0;
+  body := Copy(s, i, MaxInt);
+  if (i + 2 <= Length(s)) and (s[i] = '[') and (s[i + 2] = ']') then
+  begin
+    c := s[i + 1];
+    if c = ' ' then st := 1
+    else if (c = 'x') or (c = 'X') or (c = #$0445) or (c = #$0425) or (c = CheckMark) then st := 2;
+    if st > 0 then
+    begin
+      body := Copy(s, i + 3, MaxInt);
+      if (body <> '') and (body[1] = ' ') then Delete(body, 1, 1);
+    end;
+  end;
+  Result := st > 0;
+end;
+
+function TrimRightW(const s: UnicodeString): UnicodeString;
+var
+  i: Integer;
+begin
+  i := Length(s);
+  while (i > 0) and ((s[i] = ' ') or (s[i] = #9)) do Dec(i);
+  Result := Copy(s, 1, i);
+end;
+
+// маха " ✓ 05.10 17:56" от края
+function StripDoneStamp(const s: UnicodeString): UnicodeString;
+var
+  i, k: Integer;
+  ok: Boolean;
+begin
+  Result := s;
+  i := Length(s);
+  while (i > 0) and (s[i] <> CheckMark) do Dec(i);
+  if i < 2 then Exit;
+  ok := True;
+  for k := i + 1 to Length(s) do
+    if not (IsDigitW(s[k]) or (s[k] = ' ') or (s[k] = '.') or (s[k] = ':')) then ok := False;
+  if ok then Result := TrimRightW(Copy(s, 1, i - 1));
+end;
+
+function DoneStamp: UnicodeString;
+var
+  st: TSystemTime;
+begin
+  GetLocalTime(@st);
+  Result := ' ' + CheckMark + ' ' + ZPad(st.wDay, 2) + '.' + ZPad(st.wMonth, 2) + ' ' +
+            ZPad(st.wHour, 2) + ':' + ZPad(st.wMinute, 2);
+end;
+
+// граници на реда, в който е позиция pos: [a, b)
+procedure LineBounds(pos: LongInt; out a, b: LongInt);
+var
+  total: LongInt;
+  line: UnicodeString;
+  i: Integer;
+begin
+  total := TextLenInternal;
+  if pos > total then pos := total;
+  a := pos - 4096;
+  if a < 0 then a := 0;
+  line := GetRange(a, pos);
+  i := Length(line);
+  while (i > 0) and not IsBreak(line[i]) do Dec(i);
+  a := pos - (Length(line) - i);
+  if pos + 4096 < total then line := GetRange(pos, pos + 4096)
+  else line := GetRange(pos, total);
+  i := 1;
+  while (i <= Length(line)) and not IsBreak(line[i]) do Inc(i);
+  b := pos + i - 1;
+  if b > total then b := total;
+end;
+
+// маркираните редове (поне един): [a, b) без последния нов ред
+procedure SelLines(out a, b: LongInt; out multi: Boolean);
+var
+  cr: TCharRange;
+  e, x: LongInt;
+  t: UnicodeString;
+begin
+  EdMsg(EM_EXGETSEL, 0, LPARAM(@cr));
+  e := cr.cpMax;
+  if e > cr.cpMin then
+  begin
+    t := GetRange(e - 1, e);
+    if (t <> '') and IsBreak(t[1]) then Dec(e);   // маркирано до началото на следващия ред
+  end;
+  LineBounds(cr.cpMin, a, x);
+  LineBounds(e, x, b);
+  if b < a then b := a;
+  multi := x > a;
+end;
+
+procedure CmdToggleCheck;
+var
+  a, b: LongInt;
+  multi: Boolean;
+  text, pre, body, res: UnicodeString;
+  L: TStrArr;
+  i, st, target: Integer;
+  cr: TCharRange;
+begin
+  if gRunning then begin MessageBeep(MB_OK); Exit; end;
+  SelLines(a, b, multi);
+  text := GetRange(a, b);
+  SplitLines(text, L);
+  target := -1;                       // какво правим - по първия непразен ред
+  for i := 0 to High(L) do
+    if TrimW(L[i]) <> '' then
+    begin
+      ParseCheck(L[i], pre, st, body);
+      case st of
+        0: target := 1;               // няма кутийка -> добави [ ]
+        1: target := 2;               // [ ] -> [x]
+        2: target := 1;               // [x] -> [ ]
+      end;
+      Break;
+    end;
+  if target < 0 then
+  begin                               // празен ред -> нова задача
+    ParseCheck(text, pre, st, body);
+    ReplaceRange(a, b, pre + '[ ] ', False);
+    Exit;
+  end;
+  res := '';
+  for i := 0 to High(L) do
+  begin
+    if i > 0 then res := res + #13;
+    if TrimW(L[i]) = '' then begin res := res + L[i]; Continue; end;
+    ParseCheck(L[i], pre, st, body);
+    if target = 2 then
+    begin
+      if st = 1 then res := res + pre + '[x] ' + StripDoneStamp(body) + DoneStamp
+      else res := res + L[i];
+    end
+    else if st = 0 then res := res + pre + '[ ] ' + body
+    else res := res + pre + '[ ] ' + StripDoneStamp(body);
+  end;
+  if res = text then Exit;
+  ReplaceRange(a, b, res, multi);
+  if not multi then
+  begin                               // курсорът - в края на реда
+    cr.cpMin := a + Length(res); cr.cpMax := cr.cpMin;
+    EdMsg(EM_EXSETSEL, 0, LPARAM(@cr));
+  end;
+end;
+
 { ======================= auto-indent ======================= }
 
 // Enter -> нов ред със същия отстъп (интервали/табове) като текущия
 function DoAutoIndent: Boolean;
 var
   cr: TCharRange;
-  a: LongInt;
-  line, ind: UnicodeString;
-  i: Integer;
+  a, la, lb: LongInt;
+  line, ind, pre, body, full: UnicodeString;
+  i, st: Integer;
 begin
   Result := False;
   if not fAutoIndent then Exit;
@@ -3543,6 +4356,18 @@ begin
   line := GetRange(a, cr.cpMin);
   for i := Length(line) downto 1 do
     if IsBreak(line[i]) then begin Delete(line, 1, i); Break; end;
+  // списък със задачи: Enter продължава с "[ ] ", Enter на празна задача я маха
+  if (cr.cpMin = cr.cpMax) and ParseCheck(line, pre, st, body) then
+  begin
+    LineBounds(cr.cpMin, la, lb);
+    full := GetRange(la, lb);
+    if ParseCheck(full, pre, st, body) and (TrimW(body) = '') then
+      ReplaceRange(la, lb, '', False)
+    else
+      EdMsg(EM_REPLACESEL, WPARAM(True), LPARAM(PWideChar(UnicodeString(#13) + pre + '[ ] ')));
+    EdMsg(EM_SCROLLCARET, 0, 0);
+    Exit(True);
+  end;
   i := 1;
   while (i <= Length(line)) and ((line[i] = ' ') or (line[i] = #9)) do Inc(i);
   ind := Copy(line, 1, i - 1);
@@ -3629,6 +4454,25 @@ begin
   Result := PWideChar(@buf[0]);
 end;
 
+function CollapseCrCrLf(const t: UnicodeString): UnicodeString;
+var
+  i, o: Integer;
+begin
+  Result := t;
+  UniqueString(Result);
+  o := 0;
+  i := 1;
+  while i <= Length(t) do
+  begin
+    if (t[i] = #13) and (i + 2 <= Length(t)) and (t[i + 1] = #13) and (t[i + 2] = #10) then
+      Inc(i);                         // първият CR отпада
+    Inc(o);
+    Result[o] := t[i];
+    Inc(i);
+  end;
+  SetLength(Result, o);
+end;
+
 // вмъква изход на gRunPos (редакторът е read-only, докато върви командата)
 procedure RunInsert(const t: UnicodeString);
 var
@@ -3640,7 +4484,11 @@ begin
   if t = '' then Exit;
   // всички нови редове -> CR (вътрешният формат на RichEdit), без
   // контролни символи и ANSI escape последователности
-  s := ConvertEol(t, eolCR, nil, f);
+  if gRunFilter then
+    // някои програми връщат входния CR + свой CRLF -> "CR CR LF" е един ред
+    s := ConvertEol(CollapseCrCrLf(t), eolCR, nil, f)
+  else
+    s := ConvertEol(t, eolCR, nil, f);
   o := 0;
   i := 1;
   while i <= Length(s) do
@@ -3666,6 +4514,12 @@ begin
   end;
   SetLength(s, o);
   if s = '' then Exit;
+  if gRunFilter then
+  begin                               // филтър: събираме, заменяме накрая наведнъж
+    gFilterOut := gFilterOut + s;
+    gRunEndsWithBreak := s[Length(s)] = #13;
+    Exit;
+  end;
 
   EdMsg(EM_SETREADONLY, 0, 0);
   cr.cpMin := gRunPos; cr.cpMax := gRunPos;
@@ -3794,17 +4648,41 @@ begin
   RunFlush(False);
 end;
 
+// само нови редове и интервали -> ''
+function StringReplace13(const s: UnicodeString): UnicodeString;
+var
+  i: Integer;
+begin
+  Result := s;
+  UniqueString(Result);
+  for i := 1 to Length(Result) do
+    if IsBreak(Result[i]) or (Result[i] = #9) then Result[i] := ' ';
+end;
+
 procedure RunDone(code: DWORD);
 var
   cr: TCharRange;
+  wasFilter: Boolean;
+  outp, note: UnicodeString;
 begin
   RunOutput;                          // каквото е останало в буфера
   RunFlush(True);
-  if not gRunEndsWithBreak then RunInsert(#13);
-  if gRunStopped then RunInsert('[stopped]'#13)
-  else if code <> 0 then RunInsert('[exit code ' + IStr(code) + ']'#13);
+  wasFilter := gRunFilter;
+  if not wasFilter then
+  begin
+    if not gRunEndsWithBreak then RunInsert(#13);
+    if gRunStopped then RunInsert('[stopped]'#13)
+    else if code <> 0 then RunInsert('[exit code ' + IStr(code) + ']'#13);
+  end;
+  gRunFilter := False;
   gRunning := False;
   EdMsg(EM_SETREADONLY, 0, 0);
+  if gRunWriterH <> 0 then
+  begin
+    WaitForSingleObject(gRunWriterH, 3000);
+    CloseHandle(gRunWriterH); gRunWriterH := 0;
+  end;
+  SetLength(gRunInput, 0);
   CloseHandle(gRunRead);   gRunRead := 0;
   CloseHandle(gRunProc);   gRunProc := 0;
   CloseHandle(gRunJob);    gRunJob := 0;
@@ -3813,6 +4691,33 @@ begin
   begin
     DeleteFileW(PWideChar(gRunTempFile));
     gRunTempFile := '';
+  end;
+  if wasFilter then
+  begin
+    outp := gFilterOut;
+    gFilterOut := '';
+    if not gFilterEndsBreak then
+      while (outp <> '') and (outp[Length(outp)] = #13) do SetLength(outp, Length(outp) - 1);
+    if gRunStopped then
+      gStatusNote := 'Filter stopped - the text is unchanged'
+    else if TrimW(StringReplace13(outp)) = '' then
+    begin
+      MessageBeep(MB_ICONASTERISK);
+      note := 'The command returned nothing';
+      if code <> 0 then note := note + ' (exit code ' + IStr(code) + ')';
+      gStatusNote := note + ' - the text is unchanged';
+    end
+    else
+    begin
+      if gFilterEndsBreak and (outp[Length(outp)] <> #13) then outp := outp + #13;
+      ReplaceRange(gFilterA, gFilterB, outp, True);
+      note := 'Filtered';
+      if code <> 0 then note := note + ' (exit code ' + IStr(code) + ')';
+      gStatusNote := note + '  -  Ctrl+Z brings the original back';
+    end;
+    EdMsg(EM_SCROLLCARET, 0, 0);
+    ScheduleStats;
+    Exit;
   end;
   cr.cpMin := gRunPos; cr.cpMax := gRunPos;    // курсорът - на нов ред след изхода
   EdMsg(EM_EXSETSEL, 0, LPARAM(@cr));
@@ -3923,8 +4828,28 @@ begin
   EdMsg(EM_SCROLLCARET, 0, 0);
 end;
 
-// пуска "cmd /c <cmd>" с изход към gRunPos
-function RunStart(const cmd: UnicodeString): Boolean;
+// пише stdin на филтъра в отделна нишка - иначе голям текст би блокирал
+// (командата чака да прочетем изхода й, ние чакаме тя да прочете входа)
+function RunWriter(param: Pointer): PtrInt;
+var
+  off, n, w: DWORD;
+begin
+  off := 0;
+  while off < DWORD(Length(gRunInput)) do
+  begin
+    n := DWORD(Length(gRunInput)) - off;
+    if n > 65536 then n := 65536;
+    w := 0;
+    if not WriteFile(gRunInWrite, gRunInput[off], n, w, nil) or (w = 0) then Break;
+    Inc(off, w);
+  end;
+  CloseHandle(gRunInWrite);           // EOF за командата
+  gRunInWrite := 0;
+  Result := 0;
+end;
+
+// пуска "cmd /c <cmd>" с изход към gRunPos; useInput -> input отива на stdin
+function RunStartEx(const cmd: UnicodeString; const input: TBytes; useInput: Boolean): Boolean;
 var
   cmdLine, dir: UnicodeString;
   sa: TSecurityAttributes;
@@ -3935,13 +4860,24 @@ var
 begin
   Result := False;
   // stdout+stderr -> pipe; stdin -> NUL (команда, която чака вход, не виси)
+  // или pipe с текста за филтъра
   FillChar(sa, SizeOf(sa), 0);
   sa.nLength := SizeOf(sa);
   sa.bInheritHandle := True;
   if not CreatePipe(gRunRead, hWrite, @sa, 0) then Exit;
   SetHandleInformation(gRunRead, HANDLE_FLAG_INHERIT, 0);
-  hNul := CreateFileW('NUL', GENERIC_READ, FILE_SHARE_READ or FILE_SHARE_WRITE,
-                      @sa, OPEN_EXISTING, 0, 0);
+  if useInput then
+  begin
+    if not CreatePipe(hNul, gRunInWrite, @sa, 0) then
+    begin
+      CloseHandle(hWrite); CloseHandle(gRunRead); gRunRead := 0;
+      Exit;
+    end;
+    SetHandleInformation(gRunInWrite, HANDLE_FLAG_INHERIT, 0);
+  end
+  else
+    hNul := CreateFileW('NUL', GENERIC_READ, FILE_SHARE_READ or FILE_SHARE_WRITE,
+                        @sa, OPEN_EXISTING, 0, 0);
 
   FillChar(si, SizeOf(si), 0);
   si.cb := SizeOf(si);
@@ -3960,6 +4896,8 @@ begin
            CREATE_NO_WINDOW_F or CREATE_SUSPENDED, nil, PWideChar(dir), @si, @pi) then
   begin
     CloseHandle(hWrite); CloseHandle(hNul); CloseHandle(gRunRead); gRunRead := 0;
+    if useInput then begin CloseHandle(gRunInWrite); gRunInWrite := 0; end;
+    gRunFilter := False;
     RunInsert('[cannot start cmd.exe]'#13);
     Exit;
   end;
@@ -3980,8 +4918,262 @@ begin
   EdMsg(EM_SETREADONLY, 1, 0);
   ScheduleStats;
   gRunThreadH := THandle(BeginThread(@RunReader, nil, tid));
+  if useInput then
+  begin
+    gRunInput := input;
+    gRunWriterH := THandle(BeginThread(@RunWriter, nil, tid));
+  end;
   Result := True;
 end;
+
+function RunStart(const cmd: UnicodeString): Boolean;
+begin
+  Result := RunStartEx(cmd, nil, False);
+end;
+
+{ ======================= скрипт от няколко реда ======================= }
+
+{ Маркирани няколко реда + Ctrl+Enter -> временен скрипт:
+    първи ред "#ps"  -> PowerShell
+    първи ред "#py"  -> Python
+    иначе            -> .cmd (cmd.exe), "@echo off" отпред
+  "#ps Get-Date" на един ред също работи. }
+
+function TempName(const prefix, ext: UnicodeString): UnicodeString;
+var
+  buf: array[0..MAX_PATHBUF-1] of WideChar;
+begin
+  GetTempPathW(MAX_PATHBUF, @buf[0]);
+  Result := UnicodeString(PWideChar(@buf[0])) + prefix + IStr(GetCurrentProcessId) + '_' +
+            IStr(GetTickCount) + ext;
+end;
+
+// "#ps", "#powershell", "#py", "#python", "#cmd", "#bat" -> 1 ps, 2 py, 3 cmd; 0 няма
+function ScriptMarker(const line: UnicodeString; out rest: UnicodeString): Integer;
+var
+  t, w: UnicodeString;
+  i: Integer;
+begin
+  Result := 0;
+  rest := '';
+  t := TrimW(line);
+  if (t = '') or (t[1] <> '#') then Exit;
+  i := 2;
+  while (i <= Length(t)) and (t[i] <> ' ') and (t[i] <> #9) do Inc(i);
+  w := AsciiLower(Copy(t, 2, i - 2));
+  if (w = 'ps') or (w = 'powershell') or (w = 'pwsh') then Result := 1
+  else if (w = 'py') or (w = 'python') then Result := 2
+  else if (w = 'cmd') or (w = 'bat') then Result := 3
+  else Exit;
+  rest := TrimW(Copy(t, i, MaxInt));
+end;
+
+function CmdRunScript(const script: UnicodeString; b: LongInt): Boolean;
+var
+  L: TStrArr;
+  kind, i, first: Integer;
+  rest, body, tmp, cmd, what: UnicodeString;
+  data: TBytes;
+  lossy: Boolean;
+  f: TEol;
+begin
+  Result := False;
+  SplitLines(script, L);
+  first := 0;
+  while (first <= High(L)) and (TrimW(L[first]) = '') do Inc(first);
+  if first > High(L) then Exit;
+  kind := ScriptMarker(L[first], rest);
+  body := '';
+  if kind <> 0 then
+  begin
+    if rest <> '' then body := rest + #13#10;
+    Inc(first);
+  end
+  else
+    kind := 3;
+  for i := first to High(L) do body := body + L[i] + #13#10;
+  if TrimW(ConvertEol(body, eolLF, nil, f)) = '' then Exit;
+
+  case kind of
+    1: begin
+         tmp := TempName('trpad_script_', '.ps1');
+         body := '[Console]::OutputEncoding = [Text.Encoding]::UTF8'#13#10 +
+                 '$ProgressPreference = ''SilentlyContinue'''#13#10 + body;
+         data := EncodeText(body, encUTF8BOM, lossy);      // PowerShell 5 иска BOM
+         cmd := 'powershell -NoProfile -ExecutionPolicy Bypass -File "' + tmp + '"';
+         what := 'PowerShell';
+       end;
+    2: begin
+         tmp := TempName('trpad_script_', '.py');
+         data := EncodeText(body, encUTF8, lossy);
+         cmd := 'python -X utf8 "' + tmp + '"';
+         what := 'Python';
+       end;
+  else
+    begin
+      tmp := TempName('trpad_script_', '.cmd');
+      if AsciiLower(Copy(TrimW(body), 1, 9)) <> '@echo off' then
+        body := '@echo off'#13#10 + body;
+      data := EncodeText(body, encUTF8, lossy);           // chcp 65001 е преди него
+      cmd := 'call "' + tmp + '"';
+      what := 'script';
+    end;
+  end;
+  if not WriteAllBytes(tmp, data) then
+  begin
+    MsgBox('Cannot write a temporary file:'#13#10 + tmp, MB_OK or MB_ICONERROR);
+    Exit;
+  end;
+  RunPrepareOutput(b);
+  Result := RunStart(cmd);
+  if Result then
+  begin
+    gRunTempFile := tmp;
+    gRunCmd := what;
+  end
+  else
+    DeleteFileW(PWideChar(tmp));
+end;
+
+{ ======================= филтър: текст -> команда -> текст ======================= }
+
+{ Ctrl+Shift+Enter: маркираният текст (или текущият ред) отива на stdin на
+  команда (UTF-8), изходът й го заменя - като "!" във Vim. Ако командата
+  не върне нищо, текстът остава непокътнат. Ctrl+Z връща оригинала. }
+
+const
+  IDC_INEDIT = 1001;
+
+var
+  InTmpl: array[0..511] of DWORD;
+  gInPrompt, gInTitle, gInText: UnicodeString;
+
+function BuildInputTemplate: Pointer;
+var
+  p: PWord;
+  procedure W(x: Word); begin p^ := x; Inc(p); end;
+  procedure D(x: DWORD); begin W(x and $FFFF); W(x shr 16); end;
+  procedure Str_(const t: UnicodeString);
+  var i: Integer;
+  begin
+    for i := 1 to Length(t) do W(Word(t[i]));
+    W(0);
+  end;
+  procedure Align4; begin if (PtrUInt(p) and 3) <> 0 then W(0); end;
+  procedure Item(style: DWORD; x, y, cx, cy: SmallInt; id, atom: Word;
+    const title: UnicodeString);
+  begin
+    Align4;
+    D(style); D(0);
+    W(Word(x)); W(Word(y)); W(Word(cx)); W(Word(cy));
+    W(id);
+    W($FFFF); W(atom);
+    Str_(title);
+    W(0);
+  end;
+begin
+  FillChar(InTmpl, SizeOf(InTmpl), 0);
+  p := @InTmpl[0];
+  D(DS_MODALFRAME or DS_CENTER or DS_SETFONT or WS_POPUP or WS_CAPTION or WS_SYSMENU);
+  D(0);
+  W(4);
+  W(0); W(0); W(280); W(74);
+  W(0); W(0);
+  Str_(Copy(gInTitle, 1, 60));
+  W(9); Str_('Segoe UI');
+  Item(WS_CHILD or WS_VISIBLE, 7, 7, 266, 18, $FFFF, $0082, Copy(gInPrompt, 1, 200));
+  Item(WS_CHILD or WS_VISIBLE or WS_BORDER or ES_AUTOHSCROLL or WS_TABSTOP,
+       7, 28, 266, 12, IDC_INEDIT, $0081, '');
+  Item(WS_CHILD or WS_VISIBLE or BS_DEFPUSHBUTTON or WS_TABSTOP,
+       169, 52, 50, 14, IDOK, $0080, 'OK');
+  Item(WS_CHILD or WS_VISIBLE or BS_PUSHBUTTON or WS_TABSTOP,
+       223, 52, 50, 14, IDCANCEL, $0080, 'Cancel');
+  Result := @InTmpl[0];
+end;
+
+function InputProc(hDlg: HWND; uMsg: UINT; wParam: WPARAM;
+                   lParam: LPARAM): PtrInt; stdcall;
+var
+  buf: array[0..2047] of WideChar;
+begin
+  Result := 1;
+  case uMsg of
+    WM_INITDIALOG:
+      begin
+        SetDlgItemTextW(hDlg, IDC_INEDIT, PWideChar(gInText));
+        SendDlgItemMessageW(hDlg, IDC_INEDIT, EM_SETSEL, 0, -1);
+        SetFocus(GetDlgItem(hDlg, IDC_INEDIT));
+        Exit(0);
+      end;
+    WM_COMMAND:
+      case LoWrd(wParam) of
+        IDOK:
+          begin
+            FillChar(buf, SizeOf(buf), 0);
+            GetDlgItemTextW(hDlg, IDC_INEDIT, @buf[0], Length(buf));
+            gInText := PWideChar(@buf[0]);
+            EndDialog(hDlg, 1);
+            Exit;
+          end;
+        IDCANCEL: begin EndDialog(hDlg, 0); Exit; end;
+      end;
+  end;
+  Result := 0;
+end;
+
+function InputBox(const title, prompt: UnicodeString; var text: UnicodeString): Boolean;
+begin
+  gInTitle := title;
+  gInPrompt := prompt;
+  gInText := text;
+  Result := DialogBoxIndirectParamW(hInstApp, BuildInputTemplate, hMain, @InputProc, 0) = 1;
+  if Result then text := gInText;
+  SetFocus(hEdit);
+end;
+
+var
+  gFilterLast: UnicodeString = '';
+
+procedure CmdFilter;
+var
+  cr: TCharRange;
+  a, b: LongInt;
+  t, cmd: UnicodeString;
+  data: TBytes;
+  lossy: Boolean;
+  f: TEol;
+begin
+  if gRunning then begin MessageBeep(MB_OK); Exit; end;
+  EdMsg(EM_EXGETSEL, 0, LPARAM(@cr));
+  if cr.cpMax > cr.cpMin then
+  begin
+    a := cr.cpMin; b := cr.cpMax;
+  end
+  else
+    LineBounds(cr.cpMin, a, b);
+  t := GetRange(a, b);
+  if t = '' then begin MessageBeep(MB_OK); Exit; end;
+  cmd := gFilterLast;
+  if not InputBox('Filter Through Command',
+       'Command - it gets the selected text on stdin (UTF-8), its output replaces the text.'#13#10 +
+       'e.g.  sort   |   findstr /i word   |   powershell -c "$input | sort -u"', cmd) then Exit;
+  cmd := TrimW(cmd);
+  if cmd = '' then Exit;
+  gFilterLast := cmd;
+  data := EncodeText(ConvertEol(t, eolCRLF, nil, f), encUTF8, lossy);
+  gFilterA := a;
+  gFilterB := b;
+  gFilterEndsBreak := IsBreak(t[Length(t)]);
+  gFilterOut := '';
+  gRunFilter := True;
+  if not RunStartEx(cmd, data, True) then
+  begin
+    gRunFilter := False;
+    Exit;
+  end;
+  gRunCmd := 'filter: ' + cmd;
+end;
+
 
 { ======================= планер: @-редове -> Task Scheduler ======================= }
 
@@ -4672,16 +5864,49 @@ end;
 
 procedure CmdRunLine;
 var
-  a, b: LongInt;
-  line, cmd: UnicodeString;
+  a, b, sa, sb: LongInt;
+  line, cmd, pre, body, rest, err: UnicodeString;
+  multi: Boolean;
+  st: Integer;
+  sch: TSched;
 begin
   if gRunning then begin MessageBeep(MB_OK); Exit; end;
+  // няколко маркирани реда -> един скрипт
+  SelLines(sa, sb, multi);
+  if multi then
+  begin
+    if not CmdRunScript(GetRange(sa, sb), sb) then MessageBeep(MB_OK);
+    Exit;
+  end;
   line := CurrentLine(a, b);
   cmd := TrimW(line);
   if cmd = '' then begin MessageBeep(MB_OK); Exit; end;
   if IsScheduleLine(cmd) then
   begin
     CmdScheduleLine(cmd, b);
+    Exit;
+  end;
+  // "[ ] 18:30 Обади се" -> напомняне, като "@ 18:30 Обади се"
+  if ParseCheck(cmd, pre, st, body) then
+  begin
+    body := StripDoneStamp(body);
+    if st = 2 then
+      gStatusNote := 'This task is already done'
+    else if ParseSchedule('@ ' + body, sch, err) then
+    begin
+      CmdScheduleLine('@ ' + body, b);
+      Exit;
+    end
+    else
+      gStatusNote := 'Reminder: ' + err + '  -  e.g.  [ ] 18:30 Call Ivan';
+    MessageBeep(MB_ICONASTERISK);
+    ScheduleStats;
+    Exit;
+  end;
+  // "#ps Get-Date" на един ред
+  if ScriptMarker(cmd, rest) <> 0 then
+  begin
+    if not CmdRunScript(cmd, b) then MessageBeep(MB_OK);
     Exit;
   end;
   RunPrepareOutput(b);
@@ -4765,6 +5990,8 @@ begin
   gMruMenu := CreatePopupMenu;
   Popup(hPop, gMruMenu, 'Recent &Files');
   MruRebuild;
+  gHistMenu := CreatePopupMenu;
+  Popup(hPop, gHistMenu, 'Histor&y');
   Sep(hPop);
   Item(hPop, IDM_FILE_PAGESETUP, 'Page Set&up...');
   Item(hPop, IDM_FILE_PRINT,     '&Print...'#9'Ctrl+P');
@@ -4798,6 +6025,7 @@ begin
   Item(hPop, IDM_EDIT_SELALL,   'Select &All'#9'Ctrl+A');
   Item(hPop, IDM_EDIT_TIME,     'Time/&Date'#9'F5');
   Item(hPop, IDM_EDIT_DAYTIME,  'Da&y and Time'#9'Ctrl+D');
+  Item(hPop, IDM_EDIT_CHECK,    'Chec&k Box [ ] / [x]'#9'Ctrl+Space');
   Item(hPop, IDM_EDIT_CALC,     'Ca&lculate'#9'F9');
   Item(hPop, IDM_EDIT_FIXLAYOUT, 'Fi&x Keyboard Layout'#9'Ctrl+Shift+K');
 
@@ -4851,8 +6079,11 @@ begin
 
   // Tools
   hPop := CreatePopupMenu;
-  Item(hPop, IDM_EDIT_RUNLINE,  '&Run Line'#9'Ctrl+Enter');
+  Item(hPop, IDM_EDIT_RUNLINE,  '&Run Line / Selected Lines'#9'Ctrl+Enter');
+  Item(hPop, IDM_TOOLS_FILTER,  '&Filter Through Command...'#9'Ctrl+Shift+Enter');
   Item(hPop, IDM_EDIT_RUNSTOP,  '&Stop Command'#9'Esc');
+  Sep(hPop);
+  Item(hPop, IDM_TOOLS_SUMS,    '&Live Sums  (total = ...)');
   Sep(hPop);
   Item(hPop, IDM_TOOLS_TASKS,   'Scheduled &Tasks');
   Item(hPop, IDM_TOOLS_DELTASK, '&Delete Task on This Line');
@@ -4870,7 +6101,7 @@ begin
 end;
 
 const
-  AccelTable: array[0..24] of TAccelEntry = (
+  AccelTable: array[0..25] of TAccelEntry = (
     (fVirt: FVIRTKEY or FCONTROL;          key: Ord('N'); cmd: IDM_FILE_NEW),
     (fVirt: FVIRTKEY or FCONTROL;          key: Ord('O'); cmd: IDM_FILE_OPEN),
     (fVirt: FVIRTKEY or FCONTROL;          key: Ord('S'); cmd: IDM_SAVE),
@@ -4883,6 +6114,7 @@ const
     (fVirt: FVIRTKEY or FSHIFT;            key: VK_F3;    cmd: IDM_EDIT_FINDPREV),
     (fVirt: FVIRTKEY;                      key: VK_F5;    cmd: IDM_EDIT_TIME),
     (fVirt: FVIRTKEY or FCONTROL;          key: Ord('D'); cmd: IDM_EDIT_DAYTIME),
+    (fVirt: FVIRTKEY or FCONTROL;          key: VK_SPACE; cmd: IDM_EDIT_CHECK),
     (fVirt: FVIRTKEY or FCONTROL;          key: VK_OEM_PLUS_K;  cmd: IDM_VIEW_ZOOMIN),
     (fVirt: FVIRTKEY or FCONTROL;          key: VK_ADD;         cmd: IDM_VIEW_ZOOMIN),
     (fVirt: FVIRTKEY or FCONTROL;          key: VK_OEM_MINUS_K; cmd: IDM_VIEW_ZOOMOUT),
@@ -4931,6 +6163,8 @@ begin
   if RegGetBin(k, 'SpeechRate', @z, SizeOf(z)) and (z <= 3) then gRateIdx := z;
   fSpeakHilite := RegGetBool(k, 'SpeechHighlight', fSpeakHilite);
   fRemindSpeak := RegGetBool(k, 'SpeakReminders', fRemindSpeak);
+  fLiveSums := RegGetBool(k, 'LiveSums', fLiveSums);
+  gFilterLast := RegGetStr(k, 'LastFilter');
   n := 0;
   for i := 0 to MRU_MAX - 1 do
   begin
@@ -4969,6 +6203,8 @@ begin
   RegPutDW(k, 'SpeechRate', gRateIdx);
   RegPutDW(k, 'SpeechHighlight', Ord(fSpeakHilite));
   RegPutDW(k, 'SpeakReminders', Ord(fRemindSpeak));
+  RegPutDW(k, 'LiveSums', Ord(fLiveSums));
+  RegPutStr(k, 'LastFilter', gFilterLast);
   for i := 0 to MRU_MAX - 1 do
     RegPutStr(k, 'Recent' + IStr(i), gMru[i]);
   RegCloseKey(k);
@@ -5039,7 +6275,8 @@ begin
       end;
 
     WM_INITMENUPOPUP:
-      UpdateEditMenu(HMENU(wParam));
+      if (gHistMenu <> 0) and (HMENU(wParam) = gHistMenu) then HistBuildMenu
+      else UpdateEditMenu(HMENU(wParam));
 
     WM_COMMAND:
       begin
@@ -5052,6 +6289,9 @@ begin
                 if gSpeaking then SpeechStop(False);   // текстът се промени -> позициите вече не важат
                 gRecPending := True;
                 ScheduleStats;
+                if fLiveSums and not gSumBusy and
+                   (Abs(Int64(GetTickCount) - Int64(gUndoTick)) > 300) then
+                  SetTimer(hMain, TIMER_SUMS, 400, nil);
                 if not fDirty then begin fDirty := True; ApplyTitle; end;
               end;
             EN_UPDATE:
@@ -5082,8 +6322,18 @@ begin
           IDM_FILE_PRINT:     PrintDoc;
           IDM_FILE_PAGESETUP: PageSetup;
           IDM_FILE_EXIT:      SendMessageW(hWnd, WM_CLOSE, 0, 0);
-          IDM_EDIT_UNDO:   EdMsg(EM_UNDO, 0, 0);
-          IDM_EDIT_REDO:   EdMsg(EM_REDO, 0, 0);
+          IDM_EDIT_UNDO:   begin gUndoTick := GetTickCount; EdMsg(EM_UNDO, 0, 0); end;
+          IDM_EDIT_REDO:   begin gUndoTick := GetTickCount; EdMsg(EM_REDO, 0, 0); end;
+          IDM_EDIT_CHECK:  CmdToggleCheck;
+          IDM_TOOLS_FILTER: CmdFilter;
+          IDM_TOOLS_SUMS:
+            begin
+              fLiveSums := not fLiveSums;
+              SyncMenus;
+              if fLiveSums then UpdateLiveSums;
+            end;
+          IDM_HIST_FIRST..IDM_HIST_LAST: HistRestore(cmd - IDM_HIST_FIRST);
+          IDM_HIST_FOLDER: HistOpenFolder;
           IDM_EDIT_CUT:    EdMsg(WM_CUT, 0, 0);
           IDM_EDIT_COPY:   EdMsg(WM_COPY, 0, 0);
           IDM_EDIT_PASTE:  EdMsg(WM_PASTE, 0, 0);
@@ -5324,6 +6574,11 @@ begin
           end;
         TIMER_AUTOSAVE:
           RecoverySnapshot;
+        TIMER_SUMS:
+          begin
+            KillTimer(hWnd, TIMER_SUMS);
+            UpdateLiveSums;
+          end;
       end;
 
     WM_ACTIVATEAPP:                   // връщане към програмата -> файлът променен ли е?
@@ -5472,13 +6727,17 @@ begin
   begin
     // активният modeless Find/Replace си обработва клавишите
     if (hFindDlg <> 0) and IsDialogMessageW(hFindDlg, @msg) then Continue;
+    // Undo/Redo: живите сметки не бива веднага да "върнат" отменената промяна
+    if (msg.message = WM_KEYDOWN) and (msg.hwnd = hEdit) and
+       (GetKeyState(VK_CONTROL) < 0) and ((msg.wParam = Ord('Z')) or (msg.wParam = Ord('Y'))) then
+      gUndoTick := GetTickCount;
     if TranslateAcceleratorW(hMain, gAccel, @msg) <> 0 then Continue;
-    // Ctrl+Enter = изпълни реда; Esc = спри командата
+    // Ctrl+Enter = изпълни реда; Ctrl+Shift+Enter = филтър; Esc = спри командата
     if (msg.message = WM_KEYDOWN) and (msg.hwnd = hEdit) and
        (msg.wParam = VK_RETURN) and (GetKeyState(VK_CONTROL) < 0) and
        (GetKeyState(VK_MENU) >= 0) then
     begin
-      CmdRunLine;
+      if GetKeyState(VK_SHIFT) < 0 then CmdFilter else CmdRunLine;
       Continue;
     end;
     if gRunning and (msg.message = WM_KEYDOWN) and (msg.wParam = VK_ESCAPE) then

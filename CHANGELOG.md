@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.8
+- **Live sums:** a line `total =` (or `общо =`, `сума =`, `средно =`/`avg =`, `макс =`/`max =`, `мин =`/`min =`, `брой =`/`count =`) fills itself in from the numbers above it and updates as you type. The last number of each line counts. Times, dates and lines ending with `:` are skipped. `1 250,50` and `3.20` both work, and the result keeps your format. One Ctrl+Z undoes a recalculation. *Tools → Live Sums* turns it off.
+- **Check boxes:** **Ctrl+Space** toggles `[ ]` → `[x] … ✓ 05.10 17:56` → `[ ]`. It works on several selected lines, and on an empty line it starts a new task. Enter continues the list, and Enter on an empty task ends it. `[х]` typed in Cyrillic also counts as done.
+- **Ctrl+Enter on `[ ] 18:30 Call Ivan`** creates a reminder, just like an `@` line.
+- **Multi-line scripts:** select several lines and press **Ctrl+Enter**. They run as one `.cmd` script, or as PowerShell / Python when the first line is `#ps` / `#py`. A single line such as `#ps Get-Date` works too.
+- **Filter through a command:** **Ctrl+Shift+Enter** sends the selection (or the current line) to a command's stdin, and the command's output replaces it, like `!` in Vim. If the command prints nothing, the text stays as it was. Ctrl+Z restores the original. The last command is remembered.
+- **History (time machine):** every Save keeps a version in `%LOCALAPPDATA%\TinyRetroPad\history`. The first save also keeps the version that was on disk before. Identical saves are not duplicated, and the last 100 versions are kept. *File → History* restores a version with one click, and Ctrl+Z goes back.
+
 ## 2.7.1
 - **Ctrl+D** inserts the weekday, date and time (`понеделник, 05.10.2026 14:32`). The weekday name follows the Windows regional settings.
 
